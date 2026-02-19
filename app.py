@@ -1,237 +1,149 @@
 import streamlit as st
-import cloudscraper
-from bs4 import BeautifulSoup
+import feedparser # RSS 파싱용 라이브러리
+import urllib.parse
 from datetime import datetime, timedelta
-import re
+import pandas as pd
 
 # --------------------------------------------------------------------------
-# 1. 강력한 스크래퍼 설정 (모바일 브라우저 위장)
+# 1. 설정 및 디자인
 # --------------------------------------------------------------------------
-st.set_page_config(page_title="Real-time KBO Monitor", layout="wide")
+st.set_page_config(page_title="KBO Radar Final", layout="wide")
 
-# 모바일 User-Agent 사용 (PC보다 차단 확률이 현저히 낮음)
-MOBILE_UA = {
-    'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-    'Referer': 'https://www.google.com'
-}
+# CSS: 버튼 및 스타일 디자인
+st.markdown("""
+    <style>
+    .big-font { font-size:18px !important; font-weight: bold; }
+    .card { background-color: #262730; padding: 15px; border-radius: 10px; margin-bottom: 10px; border: 1px solid #444; }
+    .source-tag { font-size: 12px; padding: 3px 6px; border-radius: 4px; margin-right: 5px; }
+    .dc { background-color: #4b6584; color: white; }
+    .mlb { background-color: #20bf6b; color: white; }
+    .fmk { background-color: #3867d6; color: white; }
+    a { text-decoration: none; color: #ffffff !important; }
+    a:hover { color: #ff4b4b !important; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# Cloudscraper 인스턴스 (보안 우회용)
-scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'mobile': True})
-
-# 구단별 키워드 및 ID 매핑
+# 구단별 검색 키워드 매핑
 TEAMS = {
-    "한화 이글스": {"dc_id": "hanwhaeagles_new", "keyword": "한화"},
-    "KIA 타이거즈": {"dc_id": "tigers_new", "keyword": "기아"},
-    "롯데 자이언츠": {"dc_id": "giants_new2", "keyword": "롯데"},
-    "LG 트윈스": {"dc_id": "lgtwins_new", "keyword": "LG"},
-    "두산 베어스": {"dc_id": "doosanbears_new1", "keyword": "두산"},
-    "삼성 라이온즈": {"dc_id": "samsunglions_new", "keyword": "삼성"},
-    "SSG 랜더스": {"dc_id": "wyverns_new", "keyword": "SSG"},
-    "키움 히어로즈": {"dc_id": "heros_new", "keyword": "키움"},
-    "NC 다이노스": {"dc_id": "ncdinos", "keyword": "NC"},
-    "KT 위즈": {"dc_id": "ktwiz", "keyword": "KT"}
+    "한화 이글스": "한화",
+    "KIA 타이거즈": "KIA", # 기아는 검색어 혼동이 있어 영어 KIA 권장
+    "롯데 자이언츠": "롯데",
+    "LG 트윈스": "LG",
+    "두산 베어스": "두산",
+    "삼성 라이온즈": "삼성",
+    "SSG 랜더스": "SSG",
+    "키움 히어로즈": "키움",
+    "NC 다이노스": "NC",
+    "KT 위즈": "KT"
 }
 
 # --------------------------------------------------------------------------
-# 2. 날짜 필터링 로직 (단순화 & 강화)
+# 2. 핵심 로직: Google News RSS 우회 (차단 방지)
 # --------------------------------------------------------------------------
-def is_fresh(date_str):
+def get_google_rss_issues(site_url, keyword):
     """
-    XX:XX (오늘) -> 무조건 True
-    MM.DD (날짜) -> 어제/오늘이면 True, 아니면 False
+    사이트 직접 접속 대신 구글 뉴스 RSS를 통해 우회 접속
+    장점: IP 차단 안 당함, 속도 빠름
+    단점: 아주 실시간(1분 전) 글은 없을 수 있음 -> 버튼으로 보완
     """
-    date_str = date_str.strip()
-    
-    # 1. 시간으로 표시되면 오늘 글임 (예: 14:22)
-    if ":" in date_str and len(date_str) < 8:
-        return True
-    
-    # 2. 날짜로 표시되면 (예: 02.19 or 2024.02.19)
-    try:
-        # 숫자와 점(.)만 남기고 제거
-        clean_date = re.sub(r'[^0-9.]', '', date_str)
-        parts = clean_date.split('.')
-        
-        now = datetime.now()
-        
-        # 연도가 없는 경우 (MM.DD)
-        if len(parts) == 2:
-            post_date = datetime(now.year, int(parts[0]), int(parts[1]))
-        # 연도가 있는 경우 (YYYY.MM.DD)
-        elif len(parts) == 3:
-            year = int(parts[0])
-            if year < 100: year += 2000 # 24.02.19 대응
-            post_date = datetime(year, int(parts[1]), int(parts[2]))
-        else:
-            return False # 형식 불명
-
-        # 48시간 이내 체크
-        diff = now - post_date
-        return diff.days <= 2
-    except:
-        return True # 파싱 에러나면 안전하게 포함
-
-# --------------------------------------------------------------------------
-# 3. 크롤링 엔진 (전략 수정됨)
-# --------------------------------------------------------------------------
-
-@st.cache_data(ttl=120)
-def get_dc_mobile(team_name):
-    """전략: 모바일 페이지(m.dcinside) 사용 -> 차단 우회 및 파싱 용이"""
-    team_info = TEAMS.get(team_name)
-    # 모바일용 추천(개념)글 목록
-    url = f"https://m.dcinside.com/board/{team_info['dc_id']}?recommend=1"
+    # 검색 쿼리: site:fmkorea.com "한화" when:1d (1일 이내)
+    encoded_query = urllib.parse.quote(f'site:{site_url} "{keyword}" when:2d')
+    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
     
     try:
-        resp = scraper.get(url, headers=MOBILE_UA, timeout=10)
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        
-        # 모바일 리스트 구조
-        items = soup.select('.gall-detail-lst li .subject')
-        
+        feed = feedparser.parse(rss_url)
         results = []
-        for item in items:
-            title_txt = item.select_one('.tit').text.strip()
-            # 모바일 날짜: <span class="date">14:22</span>
-            date_txt = item.select_one('.date').text.strip()
+        for entry in feed.entries[:5]: # 상위 5개
+            title = entry.title
+            # 구글 RSS 제목에서 사이트 이름 제거 (예: "제목 - 에펨코리아")
+            if "-" in title:
+                title = title.rsplit("-", 1)[0].strip()
             
-            if is_fresh(date_txt):
-                link = item.get('href', '#') # 링크 추출
-                # 링크가 상대경로인 경우 처리
-                if not link.startswith('http'):
-                    link = f"https://m.dcinside.com{link}"
-                    
-                results.append({'title': title_txt, 'link': link, 'date': date_txt})
-                if len(results) >= 3: break
-                
-        return results if results else [{'title': '48시간 내 개념글 없음', 'link': '#', 'date': '-'}]
-    except Exception as e:
-        return [{'title': f'DC 접속 실패: {e}', 'link': '#', 'date': 'Error'}]
-
-@st.cache_data(ttl=120)
-def get_mlb_filter(team_name):
-    """전략: 검색 기능 포기 -> 최신글 목록(3페이지) 긁어서 '팀명' 필터링 (최신성 보장)"""
-    keyword = TEAMS[team_name]['keyword']
-    base_url = "https://mlbpark.donga.com/mp/b.php?b=kbotown"
-    
-    results = []
-    try:
-        # 1~2페이지만 빠르게 스캔
-        for page in range(1, 3):
-            url = f"{base_url}&p={page * 30}" # 엠팍 페이징 계산
-            resp = scraper.get(url, headers=MOBILE_UA, timeout=5)
-            soup = BeautifulSoup(resp.text, 'html.parser')
+            link = entry.link
+            pub_date = entry.published_parsed
             
-            rows = soup.select('.tbl_type01 tbody tr')
-            for row in rows:
-                if 'notice' in row.get('class', []): continue # 공지 제외
-
-                title_tag = row.select_one('.tit a')
-                date_tag = row.select_one('.date')
-                
-                if title_tag and date_tag:
-                    title_txt = title_tag.text.strip()
-                    date_txt = date_tag.text.strip()
-                    
-                    # 1. 날짜 먼저 체크
-                    if not is_fresh(date_txt): continue
-                    
-                    # 2. 제목에 팀 이름이 있는지 체크 (이게 핵심)
-                    if keyword in title_txt:
-                        results.append({'title': title_txt, 'link': title_tag['href'], 'date': date_txt})
-                        if len(results) >= 3: return results
-                        
-        return results if results else [{'title': f'{keyword} 관련 최신글 없음', 'link': '#', 'date': '-'}]
-    except Exception as e:
-        return [{'title': f'엠팍 접속 실패: {e}', 'link': '#', 'date': 'Error'}]
-
-@st.cache_data(ttl=120)
-def get_fmk_google_fallback(team_name):
-    """전략: 펨코 직접 접속 시도 -> 실패시 구글 검색 결과 사용"""
-    keyword = TEAMS[team_name]['keyword']
-    
-    # 1차 시도: 펨코 통합검색 (Cloudscraper)
-    target_url = f"https://www.fmkorea.com/search.php?mid=baseball&search_keyword={keyword}&search_target=title_content"
-    
-    try:
-        resp = scraper.get(target_url, headers=MOBILE_UA, timeout=5)
-        
-        # 403 Forbidden 등 차단 확인
-        if resp.status_code != 200 or "Cloudflare" in resp.text:
-            raise Exception("Blocked")
-
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        items = soup.select('.li.li_best2_pop0') # 인기글
-        if not items: items = soup.select('.searchResult > li') # 일반글
-
-        results = []
-        for item in items:
-            title_tag = item.select_one('dl > dt > a')
-            time_tag = item.select_one('.time') or item.select_one('.regdate')
+            # 날짜 포맷팅
+            date_str = f"{pub_date.tm_mon}/{pub_date.tm_mday} {pub_date.tm_hour}:{pub_date.tm_min:02d}"
             
-            if title_tag and time_tag:
-                date_txt = time_tag.text.strip()
-                if is_fresh(date_txt):
-                    # 링크 처리
-                    raw_link = title_tag['href']
-                    link = f"https://www.fmkorea.com{raw_link}" if 'fmkorea' not in raw_link else raw_link
-                    results.append({'title': title_tag.text.strip(), 'link': link, 'date': date_txt})
-                    if len(results) >= 3: return results
-        
-        if results: return results
-
+            results.append({'title': title, 'link': link, 'date': date_str})
+        return results
     except Exception:
-        # 2차 시도 (실패 시): 그냥 에러 메시지 대신 '직접 링크' 제공
-        # 구글 검색을 긁는 건 더 위험하므로 사용자에게 우회 링크 제공이 가장 확실함
-        pass
+        return []
 
-    return [{'title': '🚫 펨코 보안 차단됨 (클릭하여 직접 보기)', 'link': target_url, 'date': 'Link'}]
-
+# --------------------------------------------------------------------------
+# 3. 직접 링크 생성기 (데이터 없을 때 비상용)
+# --------------------------------------------------------------------------
+def get_direct_link(site_code, keyword):
+    if site_code == "DC":
+        # 디시 통합검색 (최신순)
+        return f"https://search.dcinside.com/combine/q/{keyword}/w/gall/s/date"
+    elif site_code == "MLB":
+        # 엠팍 검색
+        return f"https://mlbpark.donga.com/mp/b.php?select=sct&m=search&b=kbotown&search_select=sct&search_input={keyword}"
+    elif site_code == "FMK":
+        # 펨코 검색
+        return f"https://www.fmkorea.com/search.php?mid=baseball&search_keyword={keyword}&search_target=title_content"
+    return "#"
 
 # --------------------------------------------------------------------------
 # 4. UI 렌더링
 # --------------------------------------------------------------------------
-st.title("⚾ KBO Radar (Final Ver.)")
-st.markdown("---")
+st.title("⚾ KBO 통합 대시보드 (RSS Ver.)")
+st.caption("서버 차단을 우회하여 구글이 수집한 데이터를 보여줍니다. 만약 내용이 없으면 버튼을 눌러주세요.")
 
-selected_team = st.selectbox("구단을 선택하세요", list(TEAMS.keys()))
+selected_team_name = st.selectbox("구단을 선택하세요", list(TEAMS.keys()))
+keyword = TEAMS[selected_team_name]
 
-if st.button("새로고침 (데이터 가져오기)", type="primary"):
+if st.button("새로고침", type="primary"):
     
     col1, col2, col3 = st.columns(3)
     
-    # 1. DC Mobile
+    # 1. 디시인사이드
     with col1:
-        st.subheader("👿 DC (Mobile)")
-        with st.spinner('DC 접속 중...'):
-            data = get_dc_mobile(selected_team)
-            st.divider()
+        st.subheader("👿 디시인사이드")
+        data = get_google_rss_issues("dcinside.com", keyword)
+        if data:
             for item in data:
-                st.markdown(f"**[{item['title']}]({item['link']})**")
-                st.caption(f"🕒 {item['date']}")
-                st.write("")
+                st.markdown(f"""
+                <div class="card" style="border-left: 5px solid #4b6584;">
+                    <a href="{item['link']}" target="_blank"><b>{item['title']}</b></a><br>
+                    <span style="color:grey; font-size:0.8em;">{item['date']}</span>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.warning("최신 수집 데이터 없음")
+            st.link_button(f"👉 {keyword} 갤러리/검색 바로가기", get_direct_link("DC", keyword))
 
-    # 2. MLBPark Filter
+    # 2. 엠엘비파크
     with col2:
-        st.subheader("🏟️ 엠팍 (KBO타운)")
-        with st.spinner('엠팍 최신글 스캔 중...'):
-            data = get_mlb_filter(selected_team)
-            st.divider()
+        st.subheader("🏟️ 엠엘비파크")
+        data = get_google_rss_issues("mlbpark.donga.com", keyword)
+        if data:
             for item in data:
-                st.markdown(f"**[{item['title']}]({item['link']})**")
-                st.caption(f"🕒 {item['date']}")
-                st.write("")
+                st.markdown(f"""
+                <div class="card" style="border-left: 5px solid #20bf6b;">
+                    <a href="{item['link']}" target="_blank"><b>{item['title']}</b></a><br>
+                    <span style="color:grey; font-size:0.8em;">{item['date']}</span>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.warning("최신 수집 데이터 없음")
+            st.link_button(f"👉 엠팍 '{keyword}' 검색 결과 보기", get_direct_link("MLB", keyword))
 
-    # 3. FMKorea (w/ Fallback)
+    # 3. 에펨코리아
     with col3:
-        st.subheader("⚽ 펨코 (야구탭)")
-        with st.spinner('펨코 뚫는 중...'):
-            data = get_fmk_google_fallback(selected_team)
-            st.divider()
+        st.subheader("⚽ 에펨코리아")
+        data = get_google_rss_issues("fmkorea.com", keyword)
+        # 펨코는 RSS도 잘 안 잡힐 때가 많음 -> 버튼 유도
+        if data:
             for item in data:
-                if item['date'] == 'Link':
-                    st.warning(f"[{item['title']}]({item['link']})")
-                else:
-                    st.markdown(f"**[{item['title']}]({item['link']})**")
-                    st.caption(f"🕒 {item['date']}")
-                st.write("")
+                st.markdown(f"""
+                <div class="card" style="border-left: 5px solid #3867d6;">
+                    <a href="{item['link']}" target="_blank"><b>{item['title']}</b></a><br>
+                    <span style="color:grey; font-size:0.8em;">{item['date']}</span>
+                </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.info("보안이 강력하여 직접 이동이 빠릅니다.")
+            st.link_button(f"👉 펨코 '{keyword}' 탭 바로가기", get_direct_link("FMK", keyword))
+
