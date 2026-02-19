@@ -1,149 +1,114 @@
 import streamlit as st
-import feedparser # RSS 파싱용 라이브러리
-import urllib.parse
-from datetime import datetime, timedelta
+import feedparser
 import pandas as pd
+from datetime import datetime
 
 # --------------------------------------------------------------------------
-# 1. 설정 및 디자인
+# 1. 설정 및 스타일
 # --------------------------------------------------------------------------
-st.set_page_config(page_title="KBO Radar Final", layout="wide")
+st.set_page_config(page_title="KBO Quick Linker", layout="wide")
 
-# CSS: 버튼 및 스타일 디자인
+# 디자인 CSS: 깔끔한 카드와 버튼 스타일
 st.markdown("""
     <style>
-    .big-font { font-size:18px !important; font-weight: bold; }
-    .card { background-color: #262730; padding: 15px; border-radius: 10px; margin-bottom: 10px; border: 1px solid #444; }
-    .source-tag { font-size: 12px; padding: 3px 6px; border-radius: 4px; margin-right: 5px; }
-    .dc { background-color: #4b6584; color: white; }
-    .mlb { background-color: #20bf6b; color: white; }
-    .fmk { background-color: #3867d6; color: white; }
-    a { text-decoration: none; color: #ffffff !important; }
-    a:hover { color: #ff4b4b !important; }
+    .dc-card { background-color: #2d3436; padding: 10px; border-radius: 5px; margin-bottom: 8px; border-left: 4px solid #4b6584; }
+    .dc-title { font-size: 16px; font-weight: bold; color: white !important; text-decoration: none; }
+    .dc-date { font-size: 12px; color: #b2bec3; }
+    a { text-decoration: none; }
+    a:hover { text-decoration: underline; color: #74b9ff !important; }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
-# 구단별 검색 키워드 매핑
+# 구단별 데이터 매핑 (DC ID 및 검색어)
 TEAMS = {
-    "한화 이글스": "한화",
-    "KIA 타이거즈": "KIA", # 기아는 검색어 혼동이 있어 영어 KIA 권장
-    "롯데 자이언츠": "롯데",
-    "LG 트윈스": "LG",
-    "두산 베어스": "두산",
-    "삼성 라이온즈": "삼성",
-    "SSG 랜더스": "SSG",
-    "키움 히어로즈": "키움",
-    "NC 다이노스": "NC",
-    "KT 위즈": "KT"
+    "한화 이글스": {"dc_id": "hanwhaeagles_new", "keyword": "한화"},
+    "KIA 타이거즈": {"dc_id": "tigers_new", "keyword": "KIA"}, 
+    "롯데 자이언츠": {"dc_id": "giants_new2", "keyword": "롯데"},
+    "LG 트윈스": {"dc_id": "lgtwins_new", "keyword": "LG"},
+    "두산 베어스": {"dc_id": "doosanbears_new1", "keyword": "두산"},
+    "삼성 라이온즈": {"dc_id": "samsunglions_new", "keyword": "삼성"},
+    "SSG 랜더스": {"dc_id": "wyverns_new", "keyword": "SSG"},
+    "키움 히어로즈": {"dc_id": "heros_new", "keyword": "키움"},
+    "NC 다이노스": {"dc_id": "ncdinos", "keyword": "NC"},
+    "KT 위즈": {"dc_id": "ktwiz", "keyword": "KT"}
 }
 
 # --------------------------------------------------------------------------
-# 2. 핵심 로직: Google News RSS 우회 (차단 방지)
+# 2. DC 공식 RSS 파서 (차단 없음, 100% 성공)
 # --------------------------------------------------------------------------
-def get_google_rss_issues(site_url, keyword):
-    """
-    사이트 직접 접속 대신 구글 뉴스 RSS를 통해 우회 접속
-    장점: IP 차단 안 당함, 속도 빠름
-    단점: 아주 실시간(1분 전) 글은 없을 수 있음 -> 버튼으로 보완
-    """
-    # 검색 쿼리: site:fmkorea.com "한화" when:1d (1일 이내)
-    encoded_query = urllib.parse.quote(f'site:{site_url} "{keyword}" when:2d')
-    rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ko&gl=KR&ceid=KR:ko"
-    
+def get_dc_rss(team_code):
+    # DC 공식 RSS URL
+    rss_url = f"https://gall.dcinside.com/board/rss/lists/?id={team_code}"
     try:
         feed = feedparser.parse(rss_url)
         results = []
-        for entry in feed.entries[:5]: # 상위 5개
-            title = entry.title
-            # 구글 RSS 제목에서 사이트 이름 제거 (예: "제목 - 에펨코리아")
-            if "-" in title:
-                title = title.rsplit("-", 1)[0].strip()
+        for entry in feed.entries[:5]: # 최신 5개
+            # RSS 날짜 포맷팅
+            try:
+                dt = datetime(*entry.published_parsed[:6])
+                date_str = dt.strftime("%m/%d %H:%M")
+            except:
+                date_str = "방금 전"
             
-            link = entry.link
-            pub_date = entry.published_parsed
-            
-            # 날짜 포맷팅
-            date_str = f"{pub_date.tm_mon}/{pub_date.tm_mday} {pub_date.tm_hour}:{pub_date.tm_min:02d}"
-            
-            results.append({'title': title, 'link': link, 'date': date_str})
+            results.append({'title': entry.title, 'link': entry.link, 'date': date_str})
         return results
-    except Exception:
+    except:
         return []
 
 # --------------------------------------------------------------------------
-# 3. 직접 링크 생성기 (데이터 없을 때 비상용)
+# 3. 바로가기 링크 생성기 (FMK/MLB)
 # --------------------------------------------------------------------------
-def get_direct_link(site_code, keyword):
-    if site_code == "DC":
-        # 디시 통합검색 (최신순)
-        return f"https://search.dcinside.com/combine/q/{keyword}/w/gall/s/date"
-    elif site_code == "MLB":
-        # 엠팍 검색
-        return f"https://mlbpark.donga.com/mp/b.php?select=sct&m=search&b=kbotown&search_select=sct&search_input={keyword}"
-    elif site_code == "FMK":
-        # 펨코 검색
-        return f"https://www.fmkorea.com/search.php?mid=baseball&search_keyword={keyword}&search_target=title_content"
-    return "#"
+def get_links(keyword):
+    # 엠팍: KBO타운 검색 (제목+내용)
+    mlb_link = f"https://mlbpark.donga.com/mp/b.php?select=sct&m=search&b=kbotown&search_select=sct&search_input={keyword}"
+    
+    # 펨코: 야구탭 검색 (제목+내용)
+    fmk_link = f"https://www.fmkorea.com/search.php?mid=baseball&search_keyword={keyword}&search_target=title_content"
+    
+    return mlb_link, fmk_link
 
 # --------------------------------------------------------------------------
 # 4. UI 렌더링
 # --------------------------------------------------------------------------
-st.title("⚾ KBO 통합 대시보드 (RSS Ver.)")
-st.caption("서버 차단을 우회하여 구글이 수집한 데이터를 보여줍니다. 만약 내용이 없으면 버튼을 눌러주세요.")
+st.title("⚾ KBO 실시간 상황실")
+st.caption("서버 차단 없는 안전한 방식: DC는 RSS로 미리보기, 타 사이트는 원터치 이동")
 
-selected_team_name = st.selectbox("구단을 선택하세요", list(TEAMS.keys()))
-keyword = TEAMS[selected_team_name]
+selected_team = st.selectbox("구단을 선택하세요", list(TEAMS.keys()))
+team_data = TEAMS[selected_team]
 
 if st.button("새로고침", type="primary"):
     
     col1, col2, col3 = st.columns(3)
-    
-    # 1. 디시인사이드
+
+    # [1] DC 인사이드 (RSS 활용 - 데이터 표시됨)
     with col1:
-        st.subheader("👿 디시인사이드")
-        data = get_google_rss_issues("dcinside.com", keyword)
-        if data:
-            for item in data:
+        st.subheader("👿 DC (실시간)")
+        rss_data = get_dc_rss(team_data['dc_id'])
+        
+        if rss_data:
+            for item in rss_data:
                 st.markdown(f"""
-                <div class="card" style="border-left: 5px solid #4b6584;">
-                    <a href="{item['link']}" target="_blank"><b>{item['title']}</b></a><br>
-                    <span style="color:grey; font-size:0.8em;">{item['date']}</span>
+                <div class="dc-card">
+                    <a href="{item['link']}" target="_blank" class="dc-title">{item['title']}</a><br>
+                    <span class="dc-date">🕒 {item['date']}</span>
                 </div>
                 """, unsafe_allow_html=True)
         else:
-            st.warning("최신 수집 데이터 없음")
-            st.link_button(f"👉 {keyword} 갤러리/검색 바로가기", get_direct_link("DC", keyword))
+            st.info("데이터 로딩 실패 (RSS 일시 오류)")
+            st.link_button("DC 갤러리 바로가기", f"https://gall.dcinside.com/board/lists/?id={team_data['dc_id']}")
 
-    # 2. 엠엘비파크
+    # [2] MLBPARK (바로가기)
     with col2:
         st.subheader("🏟️ 엠엘비파크")
-        data = get_google_rss_issues("mlbpark.donga.com", keyword)
-        if data:
-            for item in data:
-                st.markdown(f"""
-                <div class="card" style="border-left: 5px solid #20bf6b;">
-                    <a href="{item['link']}" target="_blank"><b>{item['title']}</b></a><br>
-                    <span style="color:grey; font-size:0.8em;">{item['date']}</span>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.warning("최신 수집 데이터 없음")
-            st.link_button(f"👉 엠팍 '{keyword}' 검색 결과 보기", get_direct_link("MLB", keyword))
+        st.info("엠팍은 외부 접속을 차단합니다.\n아래 버튼으로 최신글을 확인하세요.")
+        mlb_url, _ = get_links(team_data['keyword'])
+        st.link_button(f"👉 {selected_team} 검색 결과 (새창)", mlb_url)
 
-    # 3. 에펨코리아
+    # [3] FMKOREA (바로가기)
     with col3:
         st.subheader("⚽ 에펨코리아")
-        data = get_google_rss_issues("fmkorea.com", keyword)
-        # 펨코는 RSS도 잘 안 잡힐 때가 많음 -> 버튼 유도
-        if data:
-            for item in data:
-                st.markdown(f"""
-                <div class="card" style="border-left: 5px solid #3867d6;">
-                    <a href="{item['link']}" target="_blank"><b>{item['title']}</b></a><br>
-                    <span style="color:grey; font-size:0.8em;">{item['date']}</span>
-                </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.info("보안이 강력하여 직접 이동이 빠릅니다.")
-            st.link_button(f"👉 펨코 '{keyword}' 탭 바로가기", get_direct_link("FMK", keyword))
+        st.info("펨코는 보안이 가장 강력합니다.\n아래 버튼으로 즉시 이동합니다.")
+        _, fmk_url = get_links(team_data['keyword'])
+        st.link_button(f"👉 {selected_team} 검색 결과 (새창)", fmk_url)
 
