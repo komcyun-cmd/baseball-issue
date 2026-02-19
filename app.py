@@ -1,15 +1,18 @@
 import streamlit as st
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
-import pandas as pd
 from datetime import datetime, timedelta
-import re
+import pandas as pd
 
-st.set_page_config(page_title="KBO Hot Issues", layout="wide")
+# --------------------------------------------------------------------------
+# 1. 설정: 브라우저처럼 위장하기 위한 Scraper 설정
+# --------------------------------------------------------------------------
+st.set_page_config(page_title="KBO Hot Issue Monitor", layout="wide")
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-}
+# Cloudscraper 인스턴스 생성 (봇 탐지 우회용)
+scraper = cloudscraper.create_scraper(
+    browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
+)
 
 TEAMS = {
     "한화 이글스": {"dc_id": "hanwhaeagles_new", "keyword": "한화"},
@@ -24,63 +27,83 @@ TEAMS = {
     "KT 위즈": {"dc_id": "ktwiz", "keyword": "KT"}
 }
 
-# --- 날짜 필터링 헬퍼 함수 ---
-def is_within_48_hours(date_str):
+# --------------------------------------------------------------------------
+# 2. 날짜 파싱 로직 (가장 중요한 부분)
+# --------------------------------------------------------------------------
+def is_within_48_hours(date_text):
     """
-    날짜 문자열을 받아 현재 시간 기준 48시간 이내인지 판단
-    형식 예: '14:22' (오늘), '05.21' (날짜), '2024.05.21'
+    다양한 날짜 형식을 처리하여 48시간 이내인지 판별
+    형식 예: '14:22' (오늘), '02.18' (올해), '2024.02.18' (전체)
     """
     try:
+        date_text = date_text.strip()
         now = datetime.now()
-        
-        # 1. 시간만 있는 경우 (오늘 게시물) -> 무조건 통과
-        if ':' in date_str and len(date_str) <= 5: 
+        post_date = None
+
+        # Case 1: 시간만 있는 경우 (예: 14:22) -> 오늘 게시물
+        if ":" in date_text and len(date_text) <= 5:
             return True
         
-        # 2. 날짜만 있는 경우 (MM.DD 또는 YYYY.MM.DD)
-        # 구분자를 . 또는 - 로 통일
-        date_str = date_str.replace('-', '.')
+        # Case 2: 날짜만 있는 경우 (예: 02.18 or 2024.02.18)
+        date_text = date_text.replace('-', '.').replace('/', '.') # 구분자 통일
         
-        # 연도가 없는 경우 (MM.DD) -> 올해로 가정
-        if len(date_str) <= 5:
-            date_str = f"{now.year}.{date_str}"
+        parts = date_text.split('.')
+        if len(parts) == 2: # MM.DD -> 올해 연도 붙임
+            post_date = datetime(now.year, int(parts[0]), int(parts[1]))
+        elif len(parts) == 3: # YYYY.MM.DD
+            year = int(parts[0])
+            # 2자리 연도(24.02.18)인 경우 처리
+            if year < 100: year += 2000 
+            post_date = datetime(year, int(parts[1]), int(parts[2]))
             
-        post_date = datetime.strptime(date_str, "%Y.%m.%d")
-        
-        # 48시간(2일) 이내인지 확인
-        diff = now - post_date
-        return diff.days <= 2
-    except:
-        return True # 파싱 실패 시 안전하게 포함시킴
+        if post_date:
+            diff = now - post_date
+            return diff.days <= 2 # 48시간(2일) 이내
+            
+        return False # 파싱 불가 시 제외
+    except Exception:
+        return True # 에러나면 일단 보여줌 (안전장치)
 
-# --- 크롤러 ---
+# --------------------------------------------------------------------------
+# 3. 크롤링 함수 (Cloudscraper 적용)
+# --------------------------------------------------------------------------
+
 @st.cache_data(ttl=300)
 def get_dc_issues(team_name):
     team_info = TEAMS.get(team_name)
+    # 일반 탭 대신 '개념글' 탭 접근
     url = f"https://gall.dcinside.com/board/lists/?id={team_info['dc_id']}&exception_mode=recommend"
     
     try:
-        response = requests.get(url, headers=HEADERS, timeout=5)
+        # requests 대신 scraper 사용
+        response = scraper.get(url, timeout=10)
+        
+        if response.status_code != 200:
+            return [{'title': f"접속 실패 (Code: {response.status_code})", 'link': '#'}]
+
         soup = BeautifulSoup(response.text, 'html.parser')
         rows = soup.select('tr.ub-content.us-post')
         
         results = []
         for row in rows:
-            date_tag = row.select_one('.gall_date')
+            # 공지사항 제외
+            if 'ub-notice' in row.get('class', []): continue
+
             title_tag = row.select_one('.gall_tit a')
+            date_tag = row.select_one('.gall_date')
             
             if title_tag and date_tag:
-                date_text = date_tag.get('title', date_tag.text.strip()) # title 속성에 정확한 시간이 있을 수 있음
-                if not is_within_48_hours(date_text):
-                    continue # 48시간 지남 -> 스킵
+                date_str = date_tag.get('title', date_tag.text.strip())
+                if not is_within_48_hours(date_str): continue
                 
                 title = title_tag.text.strip()
                 link = "https://gall.dcinside.com" + title_tag['href']
                 results.append({'title': title, 'link': link})
                 if len(results) >= 3: break
-        return results
-    except Exception:
-        return []
+                
+        return results if results else [{'title': "48시간 내 인기글 없음", 'link': '#'}]
+    except Exception as e:
+        return [{'title': f"에러: {str(e)}", 'link': '#'}]
 
 @st.cache_data(ttl=300)
 def get_mlbpark_issues(team_name):
@@ -88,7 +111,7 @@ def get_mlbpark_issues(team_name):
     url = f"https://mlbpark.donga.com/mp/b.php?b=kbotown&search_select=subject&search_input={keyword}"
     
     try:
-        response = requests.get(url, headers=HEADERS, timeout=5)
+        response = scraper.get(url, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
         rows = soup.select('.tbl_type01 tbody tr')
         
@@ -96,68 +119,91 @@ def get_mlbpark_issues(team_name):
         for row in rows:
             if 'notice' in row.get('class', []): continue
             
+            title_tag = row.select_one('.tit a')
             date_tag = row.select_one('.date')
-            a_tag = row.select_one('.tit a')
             
-            if a_tag and date_tag:
-                if not is_within_48_hours(date_tag.text.strip()):
-                    continue
+            if title_tag and date_tag:
+                if not is_within_48_hours(date_tag.text.strip()): continue
                 
-                title = a_tag.text.strip()
-                link = a_tag['href']
+                title = title_tag.text.strip()
+                link = title_tag['href']
                 results.append({'title': title, 'link': link})
                 if len(results) >= 3: break
-        return results
-    except Exception:
-        return []
+        return results if results else [{'title': "48시간 내 인기글 없음", 'link': '#'}]
+    except Exception as e:
+        return [{'title': f"에러: {str(e)}", 'link': '#'}]
 
 @st.cache_data(ttl=300)
 def get_fmkorea_issues(team_name):
     keyword = TEAMS[team_name]['keyword']
+    # 펨코 통합검색 URL
     url = f"https://www.fmkorea.com/search.php?mid=baseball&search_keyword={keyword}&search_target=title_content"
     
     try:
-        response = requests.get(url, headers=HEADERS, timeout=5)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        items = soup.select('.li.li_best2_pop0') or soup.select('.searchResult > li')
+        response = scraper.get(url, timeout=10)
         
+        if response.status_code != 200:
+             return [{'title': f"펨코 차단됨 (Code: {response.status_code})", 'link': '#'}]
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 검색 결과 선택자 (구조 변경 대비 2가지 체크)
+        items = soup.select('.li.li_best2_pop0') # 인기글 스타일
+        if not items:
+            items = soup.select('.searchResult > li') # 일반 리스트 스타일
+            
         results = []
         for item in items:
+            # 날짜 태그 확인
             time_tag = item.select_one('.time')
-            a_tag = item.select_one('dl > dt > a')
-            
-            if a_tag and time_tag:
-                # 펨코 시간 포맷: 14:22, 2024.05.21
-                if not is_within_48_hours(time_tag.text.strip()):
-                    continue
+            if not time_tag: time_tag = item.select_one('.regdate') # 다른 클래스명 대비
 
-                title = a_tag.text.strip()
-                link = "https://www.fmkorea.com" + a_tag['href'] if 'fmkorea' not in a_tag['href'] else a_tag['href']
+            title_tag = item.select_one('dl > dt > a')
+            
+            if title_tag and time_tag:
+                if not is_within_48_hours(time_tag.text.strip()): continue
+                
+                title = title_tag.text.strip()
+                href = title_tag['href']
+                link = "https://www.fmkorea.com" + href if 'fmkorea' not in href else href
+                
                 results.append({'title': title, 'link': link})
                 if len(results) >= 3: break
-        return results
-    except Exception:
-        return []
+                
+        return results if results else [{'title': "48시간 내 인기글 없음", 'link': '#'}]
+    except Exception as e:
+        return [{'title': f"에러: {str(e)}", 'link': '#'}]
 
-# --- UI ---
-st.title("⚾ KBO Hot Issue (48시간 이내)")
+# --------------------------------------------------------------------------
+# 4. UI 구성
+# --------------------------------------------------------------------------
+st.title("⚾ KBO Hot Issue (48h Real-time)")
+st.caption("※ 에펨코리아/디시는 보안이 강력하여 로딩에 3~5초 소요될 수 있습니다.")
+
 selected_team = st.selectbox("구단 선택", list(TEAMS.keys()))
 
-if st.button("새로고침"):
-    with st.spinner('최신 글을 검색 중...'):
+if st.button("새로고침", type="primary"):
+    with st.spinner(f'{selected_team} 이슈를 수집 중입니다... (Cloudscraper 작동)'):
         col1, col2, col3 = st.columns(3)
+        
+        # 데이터 수집
         dc = get_dc_issues(selected_team)
         mlb = get_mlbpark_issues(selected_team)
         fmk = get_fmkorea_issues(selected_team)
         
-        def show_list(col, name, data):
+        # 결과 출력 함수
+        def show_card(col, name, data, icon):
             with col:
-                st.subheader(name)
-                if not data:
-                    st.info("최근 48시간 내 인기글이 없거나 로딩 실패")
+                st.subheader(f"{icon} {name}")
+                st.divider()
                 for item in data:
-                    st.markdown(f"- [{item['title']}]({item['link']})")
+                    if item['link'] == '#':
+                        st.error(item['title']) # 에러나면 빨간색 표시
+                    else:
+                        st.markdown(f"**[{item['title']}]({item['link']})**")
+                        st.markdown("---")
 
-        show_list(col1, "DC (48h)", dc)
-        show_list(col2, "MLBPARK (48h)", mlb)
-        show_list(col3, "FMKOREA (48h)", fmk)
+        show_card(col1, "DC (48h)", dc, "👿")
+        show_card(col2, "MLBPARK (48h)", mlb, "🏟️")
+        show_card(col3, "FMKOREA (48h)", fmk, "⚽")
+
